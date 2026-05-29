@@ -7,9 +7,10 @@
   "scripts": {
     "start": "node src/server.js",
     "init-key": "node src/init-key.js",
-    "init-db": "node src/init-db.js"
+    "init-db": "node src/init-db.js",
+    "postinstall": "echo install complete"
   },
-  "engines": { "node": ">=20" },
+  "engines": { "node": "20.x" },
   "dependencies": {
     "fastify": "^4.28.1",
     "@fastify/cors": "^9.0.1",
