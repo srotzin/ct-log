@@ -25,6 +25,10 @@ import {
 } from './merkle.js';
 import { operatorPublicKey, signSTH } from './keys.js';
 import { tryParseReceipt } from './receipt.js';
+import * as ed from '@noble/ed25519';
+import { sha512 } from '@noble/hashes/sha512';
+import { blake3 } from '@noble/hashes/blake3';
+ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const STH_CADENCE_MS = parseInt(process.env.STH_CADENCE_MS || '30000', 10);
@@ -271,6 +275,148 @@ app.get('/v1/vestigium/:did/chain', async (req, reply) => {
       prev_hash: r.prev_hash ? toHex(r.prev_hash) : null,
       ts: r.ts,
     })),
+  };
+});
+
+// --- Attestation endpoints (for one-line counterparty signing) ---
+
+// Build a pre-filled receipt envelope for a counterparty to sign.
+// Usage: GET /v1/attest/prefill?counterparty=circle  (or visa, aave, openai, etc.)
+app.get('/v1/attest/prefill', async (req, reply) => {
+  const counterparty = String(req.query.counterparty || 'test').toLowerCase().replace(/[^a-z0-9-]/g, '');
+  if (!counterparty || counterparty.length > 32) {
+    return reply.code(400).send({ error: 'bad counterparty name' });
+  }
+
+  const TREASURY_DID = 'did:hive:treasury-001';
+  const counterparty_did = `did:${counterparty}:test`;
+
+  // Anchor to current STH.
+  const sth = stmts.latestTreeHead.get();
+  if (!sth) return reply.code(503).send({ error: 'no STH yet' });
+
+  // Treasury's current head.
+  const treasuryHead = stmts.latestVestigium.get(TREASURY_DID);
+  const prev_receipt_hash = treasuryHead ? toHex(treasuryHead.leaf_hash) : '0'.repeat(64);
+
+  const ts = Date.now();
+  const input_commit = toHex(blake3(`hive-${counterparty}-attestation-${ts}`));
+  const output_commit = toHex(blake3('counterparty-attestation-acknowledged'));
+
+  const canonical = {
+    v: 1,
+    agent_did: TREASURY_DID,
+    prev_receipt_hash,
+    log_sth_root: toHex(sth.root),
+    log_sth_size: sth.tree_size,
+    action_type: 'settlement',
+    input_commit,
+    output_commit,
+    counterparty_did,
+    ts,
+  };
+  const canonicalBytes = Buffer.from(JSON.stringify(canonical));
+  return {
+    counterparty_did,
+    canonical_json: canonical,
+    canonical_bytes_b64: canonicalBytes.toString('base64'),
+    canonical_bytes_utf8: canonicalBytes.toString('utf8'),
+    blake3_hex: toHex(blake3(canonicalBytes)),
+    sth: { epoch: sth.epoch, tree_size: sth.tree_size, root: toHex(sth.root), ts: sth.ts },
+    instructions: 'Sign canonical_bytes_b64 (decoded to raw bytes) with any Ed25519 key. POST {prefill_id, counterparty_pubkey_hex, counterparty_sig_hex, canonical_json} to /v1/attest/submit. Or use the one-line script at /sign.',
+  };
+});
+
+// Accept a counterparty-signed attestation, validate signature, land receipt.
+app.post('/v1/attest/submit', async (req, reply) => {
+  const { canonical_bytes_b64, counterparty_pubkey_hex, counterparty_sig_hex } = req.body || {};
+  if (!canonical_bytes_b64 || typeof canonical_bytes_b64 !== 'string') {
+    return reply.code(400).send({ error: 'canonical_bytes_b64 required' });
+  }
+  if (!counterparty_pubkey_hex || !counterparty_sig_hex) {
+    return reply.code(400).send({ error: 'pubkey and sig required' });
+  }
+
+  // Use the exact bytes the counterparty signed.
+  let canonicalBytes, canonical_json;
+  try {
+    canonicalBytes = Buffer.from(canonical_bytes_b64, 'base64');
+    canonical_json = JSON.parse(canonicalBytes.toString());
+  } catch (e) {
+    return reply.code(400).send({ error: 'bad canonical bytes: ' + e.message });
+  }
+  let pubkey, sig;
+  try {
+    pubkey = new Uint8Array(Buffer.from(counterparty_pubkey_hex, 'hex'));
+    sig = new Uint8Array(Buffer.from(counterparty_sig_hex, 'hex'));
+  } catch {
+    return reply.code(400).send({ error: 'bad hex encoding' });
+  }
+  if (pubkey.length !== 32 || sig.length !== 64) {
+    return reply.code(400).send({ error: 'bad pubkey or sig length' });
+  }
+
+  let sigValid = false;
+  try {
+    sigValid = await ed.verify(sig, canonicalBytes, pubkey);
+  } catch (e) {
+    return reply.code(400).send({ error: 'sig verify error: ' + e.message });
+  }
+  if (!sigValid) {
+    return reply.code(400).send({ error: 'counterparty signature invalid' });
+  }
+
+  // Build the full receipt envelope. Treasury co-signs in this version using a stored key
+  // (set via TREASURY_AGENT_PRIVATE_KEY env). If not set, we land with counterparty sig only
+  // and mark agent_sig as 'pending'. For Corey demo, env is set.
+  const treasuryPrivHex = process.env.TREASURY_AGENT_PRIVATE_KEY;
+  let agent_sig_hex = 'unsigned';
+  let agent_pubkey_hex = null;
+  if (treasuryPrivHex) {
+    const treasuryPriv = new Uint8Array(Buffer.from(treasuryPrivHex, 'hex'));
+    const treasuryPub = ed.getPublicKey(treasuryPriv);
+    const agentSig = await ed.sign(canonicalBytes, treasuryPriv);
+    agent_sig_hex = Buffer.from(agentSig).toString('hex');
+    agent_pubkey_hex = Buffer.from(treasuryPub).toString('hex');
+  }
+
+  const fullReceipt = {
+    ...canonical_json,
+    counterparty_sig: counterparty_sig_hex,
+    counterparty_pubkey: counterparty_pubkey_hex,
+    agent_sig: agent_sig_hex,
+    agent_pubkey: agent_pubkey_hex,
+  };
+
+  const payload = Buffer.from(JSON.stringify(fullReceipt));
+  const leaf = hashLeaf(payload);
+  const leafBuf = Buffer.from(leaf);
+
+  const existing = stmts.getEntryByHash.get(leafBuf);
+  if (existing) {
+    return { duplicate: true, seq: existing.seq, leaf_hash: toHex(leaf) };
+  }
+
+  const ts = Date.now();
+  const prevHashBuf = canonical_json.prev_receipt_hash ? Buffer.from(canonical_json.prev_receipt_hash, 'hex') : null;
+  const info = stmts.insertEntry.run(leafBuf, payload, canonical_json.agent_did, prevHashBuf, canonical_json.action_type, ts);
+  const seq = info.lastInsertRowid;
+  leafCache.push(leaf);
+
+  const current = stmts.vestigiumDepth.get(canonical_json.agent_did)?.depth || 0;
+  const newDepth = current + 1;
+  stmts.insertVestigium.run(canonical_json.agent_did, newDepth, seq, leafBuf, prevHashBuf, ts);
+
+  const sth = stmts.latestTreeHead.get();
+  return {
+    ok: true,
+    seq,
+    leaf_hash: toHex(leaf),
+    counterparty_did: canonical_json.counterparty_did,
+    treasury_vestigium_depth: newDepth,
+    sth: sth ? { epoch: sth.epoch, tree_size: sth.tree_size, root: toHex(sth.root), ts: sth.ts, sig: toHex(sth.sig) } : null,
+    next_sth_in_ms: STH_CADENCE_MS,
+    receipt_url: `/v1/proof/${toHex(leaf)}`,
   };
 });
 

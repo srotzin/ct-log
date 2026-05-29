@@ -5,3 +5,6 @@ data/*.db-shm
 .env
 .env.local
 *.log
+build_corey_blob.js
+submit_first_receipt.js
+/tmp/
