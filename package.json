@@ -1,0 +1,20 @@
+{
+  "name": "hive-ct-log",
+  "version": "1.0.0",
+  "description": "Hive Certificate Transparency log + vestigium layer. RFC 6962 compatible. The substrate.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "init-key": "node src/init-key.js",
+    "init-db": "node src/init-db.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "fastify": "^4.28.1",
+    "@fastify/cors": "^9.0.1",
+    "better-sqlite3": "^11.3.0",
+    "@noble/ed25519": "^2.1.0",
+    "@noble/hashes": "^1.5.0"
+  }
+}

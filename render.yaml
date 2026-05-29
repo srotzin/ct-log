@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: ct-log
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: STH_CADENCE_MS
+        value: "30000"
+      - key: CT_DB_PATH
+        value: /opt/render/project/src/data/ct.db
+      - key: LOG_OPERATOR_PRIVATE_KEY
+        sync: false
+    disk:
+      name: ct-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    healthCheckPath: /healthz
