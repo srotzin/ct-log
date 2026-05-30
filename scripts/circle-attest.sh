@@ -5,20 +5,30 @@
 # The receipt extends YOUR vestigium under the DID you choose.
 # No persistent state. No network calls except to Hive.
 #
-# Default (counterparty=test):
+# Default (counterparty=test, gives did:test:test):
 #   curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh | bash
 #
-# Custom short name (gives did:<name>:test):
-#   COUNTERPARTY=circle curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh | bash
+# Custom DID (recommended). Note env vars must be passed AFTER the | bash:
+#   curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh | DID=did:agent:kimi-k2 bash
 #
-# Full DID override (gives whatever DID you declare, e.g. did:agent:kimi-k2):
-#   DID=did:agent:kimi-k2 curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh | bash
+# Or save and run:
+#   curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh -o /tmp/hive.sh && DID=did:agent:kimi-k2 bash /tmp/hive.sh
+#
+# Or short name (gives did:<name>:test):
+#   curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh | COUNTERPARTY=circle bash
 
 set -euo pipefail
 
 CT_LOG="${CT_LOG_URL:-https://ct-log.onrender.com}"
 COUNTERPARTY="${COUNTERPARTY:-test}"
 DID="${DID:-}"
+
+# If env vars were piped in like "DID=... curl | bash" they end up in curl's env,
+# not in this script's env. Re-read from $1 as a fallback so users can also pass
+# them as positional arguments: bash script.sh did:agent:kimi-k2
+if [ -z "$DID" ] && [ "${1:-}" != "" ]; then
+  DID="$1"
+fi
 
 if [ -n "$DID" ]; then
   PREFILL_URL="${CT_LOG}/v1/attest/prefill?did=${DID}"
@@ -99,11 +109,51 @@ if backend is None:
         pass
 
 if backend is None:
-    print("")
-    print("Need either pynacl or cryptography python package. Install one of:")
-    print("  pip install pynacl")
-    print("  pip install cryptography")
-    sys.exit(3)
+    # Auto-install 'cryptography' for the current Python.
+    import subprocess, site, importlib
+    print("  No Ed25519 library found. Installing 'cryptography' (~5 MB)...")
+    install_ok = False
+    last_err = ""
+    for cmd in (
+        [sys.executable, "-m", "pip", "install", "--quiet", "--user", "--disable-pip-version-check", "cryptography"],
+        [sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "--disable-pip-version-check", "cryptography"],
+        [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "cryptography"],
+    ):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if r.returncode == 0:
+                install_ok = True
+                break
+            last_err = (r.stderr or r.stdout or "").strip().split("\n")[-1][:200]
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            last_err = str(e)
+    if not install_ok:
+        print("")
+        print(f"  Auto-install failed: {last_err}")
+        print("  Please install manually:  python3 -m pip install --user cryptography")
+        print("  Then re-run this one-liner.")
+        sys.exit(3)
+    # Refresh user site path so the freshly installed package is importable.
+    user_site = site.getusersitepackages()
+    if user_site not in sys.path:
+        sys.path.insert(0, user_site)
+    importlib.invalidate_caches()
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        sk = Ed25519PrivateKey.generate()
+        pub = sk.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        sig = sk.sign(canonical_bytes)
+        pub_hex = pub.hex()
+        sig_hex = sig.hex()
+        backend = "cryptography (auto-installed)"
+    except ImportError as e:
+        print(f"  Install reported success but import still failed: {e}")
+        print("  Open a new terminal and re-run the one-liner.")
+        sys.exit(3)
 
 print(f"  Backend:           {backend}")
 print(f"  Counterparty pub:  {pub_hex}")
