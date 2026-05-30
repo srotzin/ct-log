@@ -23,7 +23,7 @@ import {
   toHex,
   fromHex,
 } from './merkle.js';
-import { operatorPublicKey, signSTH } from './keys.js';
+import { operatorPublicKey, signSTH, operatorPqPublicKey, operatorPqScheme, signSTHPQ, signBytesPQ } from './keys.js';
 import { tryParseReceipt } from './receipt.js';
 import * as ed from '@noble/ed25519';
 import { sha512 } from '@noble/hashes/sha512';
@@ -54,7 +54,8 @@ async function publishSTH() {
     const latest = stmts.latestTreeHead.get();
     const epoch = latest ? latest.epoch + 1 : 1;
     const sig = signSTH({ epoch, treeSize: size, root, ts });
-    stmts.insertTreeHead.run(size, Buffer.from(root), ts, Buffer.from(sig));
+    const pqSig = signSTHPQ({ epoch, treeSize: size, root, ts });
+    stmts.insertTreeHead.run(size, Buffer.from(root), ts, Buffer.from(sig), pqSig ? Buffer.from(pqSig) : null);
     app.log.info({ epoch, tree_size: size, root_prefix: toHex(root).slice(0, 16) }, 'STH published');
   } catch (e) {
     app.log.error({ err: e.message }, 'STH publication failed');
@@ -83,6 +84,27 @@ app.get('/.well-known/ct-pubkey', async (req, reply) => {
     pubkey_hex: toHex(operatorPublicKey),
     log_name: 'hive-ct-v1',
     sth_cadence_ms: STH_CADENCE_MS,
+    pq: operatorPqPublicKey ? {
+      scheme: operatorPqScheme,
+      pubkey_hex: toHex(operatorPqPublicKey),
+      pubkey_len: operatorPqPublicKey.length,
+      note: 'FIPS 204 ML-DSA-65 co-signature alongside classical Ed25519. Same scheme as Circle Arc PQ roadmap.',
+    } : null,
+  };
+});
+
+// Standalone PQ pubkey endpoint for verifiers.
+app.get('/.well-known/ct-pq-pubkey', async (req, reply) => {
+  if (!operatorPqPublicKey) {
+    return reply.code(503).send({ error: 'operator PQ key not configured' });
+  }
+  return {
+    scheme: operatorPqScheme,
+    pubkey_hex: toHex(operatorPqPublicKey),
+    pubkey_len: operatorPqPublicKey.length,
+    log_name: 'hive-ct-v1',
+    canonical_sth_encoding: 'epoch(8) || tree_size(8) || root(32) || ts(8), big-endian',
+    canonical_receipt_encoding: 'utf8 JSON bytes of canonical envelope (same bytes signed by counterparty Ed25519)',
   };
 });
 
@@ -96,6 +118,9 @@ app.get('/v1/sth', async (req, reply) => {
     ts: row.ts,
     sig: toHex(row.sig),
     operator_pubkey: operatorPublicKey ? toHex(operatorPublicKey) : null,
+    pq_sig: row.pq_sig ? toHex(row.pq_sig) : null,
+    pq_scheme: row.pq_sig ? operatorPqScheme : null,
+    operator_pq_pubkey: operatorPqPublicKey ? toHex(operatorPqPublicKey) : null,
   };
 });
 
@@ -404,13 +429,30 @@ app.post('/v1/attest/submit', async (req, reply) => {
     agent_pubkey_hex = Buffer.from(treasuryPub).toString('hex');
   }
 
+  // Operator PQ co-signature over the same canonical bytes (ML-DSA-65 / FIPS 204).
+  let operator_pq_sig_hex = null;
+  let operator_pq_pubkey_hex = null;
+  let pq_scheme_used = null;
+  if (operatorPqPublicKey) {
+    const pqSig = signBytesPQ(canonicalBytes);
+    if (pqSig) {
+      operator_pq_sig_hex = Buffer.from(pqSig).toString('hex');
+      operator_pq_pubkey_hex = toHex(operatorPqPublicKey);
+      pq_scheme_used = operatorPqScheme;
+    }
+  }
+
   // The counterparty signed as the principal (agent_did). Treasury co-signs as witness.
+  // Operator additionally PQ co-signs (ML-DSA-65) so receipts are quantum-resistant at the log layer.
   const fullReceipt = {
     ...canonical_json,
     agent_sig: counterparty_sig_hex,
     agent_pubkey: counterparty_pubkey_hex,
     witness_sig: agent_sig_hex,
     witness_pubkey: agent_pubkey_hex,
+    operator_pq_sig: operator_pq_sig_hex,
+    operator_pq_pubkey: operator_pq_pubkey_hex,
+    pq_scheme: pq_scheme_used,
   };
 
   const payload = Buffer.from(JSON.stringify(fullReceipt));
@@ -441,7 +483,23 @@ app.post('/v1/attest/submit', async (req, reply) => {
     counterparty_did: canonical_json.agent_did,
     witness_did: canonical_json.witness_did,
     vestigium_depth: newDepth,
-    sth: sth ? { epoch: sth.epoch, tree_size: sth.tree_size, root: toHex(sth.root), ts: sth.ts, sig: toHex(sth.sig) } : null,
+    pq: operator_pq_sig_hex ? {
+      scheme: pq_scheme_used,
+      operator_pq_sig: operator_pq_sig_hex,
+      operator_pq_pubkey: operator_pq_pubkey_hex,
+      sig_bytes: Math.floor(operator_pq_sig_hex.length / 2),
+      pubkey_bytes: Math.floor((operator_pq_pubkey_hex || '').length / 2),
+      note: 'Operator co-signed the same canonical envelope with FIPS 204 ML-DSA-65. Verify with /.well-known/ct-pq-pubkey.',
+    } : null,
+    sth: sth ? {
+      epoch: sth.epoch,
+      tree_size: sth.tree_size,
+      root: toHex(sth.root),
+      ts: sth.ts,
+      sig: toHex(sth.sig),
+      pq_sig: sth.pq_sig ? toHex(sth.pq_sig) : null,
+      pq_scheme: sth.pq_sig ? operatorPqScheme : null,
+    } : null,
     next_sth_in_ms: STH_CADENCE_MS,
     receipt_url: `/v1/proof/${toHex(leaf)}`,
   };
