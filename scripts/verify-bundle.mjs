@@ -194,6 +194,36 @@ async function main() {
     checks.push([`Dual-root STH ${bundle.sth_dual.pq_scheme || 'ML-DSA-65'} sig (post-quantum + hash-agile)`, dualPqOk, dualPqInfo]);
   }
 
+  // -- Witness quorum (Vector 3) ------------------------------------------
+  // Verify Q-of-N hybrid (ed25519 + ML-DSA-65) witness signatures over the
+  // SAME canonical dual-hash STH bytes. Quorum-valid when ≥ threshold witnesses
+  // pass BOTH sig checks.
+  if (bundle.witness_quorum && bundle.witness_quorum.signatures && bundle.sth_dual) {
+    const sthDualBytes = encodeSTHDual({
+      epoch: bundle.sth.epoch,
+      tree_size: bundle.sth.tree_size,
+      root_blake3: bundle.sth_dual.root_blake3,
+      root_sha3_256: bundle.sth_dual.root_sha3_256,
+      ts: bundle.sth.ts,
+    });
+    const threshold = bundle.witness_quorum.threshold || 2;
+    let passing = 0;
+    const perDetails = [];
+    for (const s of bundle.witness_quorum.signatures) {
+      let edOk = false, mlOk = false;
+      try { edOk = ed.verify(fromHex(s.ed25519_sig), sthDualBytes, fromHex(s.ed25519_pubkey)); } catch {}
+      try { mlOk = ml_dsa65.verify(fromHex(s.ml_dsa_65_sig), sthDualBytes, fromHex(s.ml_dsa_65_pubkey)); } catch {}
+      if (edOk && mlOk) passing++;
+      perDetails.push(`${s.name}:${edOk && mlOk ? 'OK' : 'FAIL'}`);
+    }
+    const quorumOk = passing >= threshold;
+    checks.push([
+      `Witness quorum ${passing}-of-${bundle.witness_quorum.signatures.length} (hybrid ed25519+ML-DSA-65, threshold=${threshold})`,
+      quorumOk,
+      `(${perDetails.join(', ')})`,
+    ]);
+  }
+
   for (const [label, ok, extra] of checks) console.log(fmt(label, ok, extra));
   console.log('');
 

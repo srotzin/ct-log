@@ -30,7 +30,7 @@ import {
 import {
   operatorPublicKey, signSTH,
   operatorPqPublicKey, operatorPqScheme, signSTHPQ, signBytesPQ,
-  signSTHDual, signSTHDualPQ,
+  signSTHDual, signSTHDualPQ, encodeSTHDual,
 } from './keys.js';
 import { tryParseReceipt } from './receipt.js';
 import {
@@ -40,6 +40,13 @@ import {
   deriveDidFromPubkeys,
   HYBRID_AGENT_SCHEME,
 } from './hybrid-agent.js';
+import {
+  initWitnesses,
+  getWitnessPubkeys,
+  signSTHQuorum,
+  verifySTHQuorum,
+  WITNESS_QUORUM_SCHEME,
+} from './witnesses.js';
 import { fetchLatticeEntropy, LATTICE_NAMES, deriveLatticeKey, signWithLatticeKey } from './entropy.js';
 import * as ed from '@noble/ed25519';
 import { sha512 } from '@noble/hashes/sha512';
@@ -272,7 +279,7 @@ app.get('/v1/proof-bundle/:leaf_hash', async (req, reply) => {
     ? inclusionProofSha3(leafCacheSha3.slice(0, sth.tree_size), entry.seq - 1)
     : null;
   return {
-    bundle_version: 2,
+    bundle_version: 3,
     log_name: 'hive-ct-v1',
     leaf_hash,
     seq: entry.seq,
@@ -309,6 +316,20 @@ app.get('/v1/proof-bundle/:leaf_hash', async (req, reply) => {
       pq_sig: sth.pq_sig_sha3 ? toHex(sth.pq_sig_sha3) : null,
       pq_scheme: sth.pq_sig_sha3 ? operatorPqScheme : null,
     } : null,
+    // Vector 3 — witness quorum (in-process pseudo-witnesses, hybrid signed).
+    // Each witness signs the SAME canonical dual-hash STH bytes with its own
+    // independent ed25519 + ML-DSA-65 keys. Quorum-valid when ≥ threshold
+    // witnesses have BOTH sigs verify. Deterministic: same STH → same quorum.
+    witness_quorum: sha3Available ? (() => {
+      const canon = encodeSTHDual({
+        epoch: sth.epoch,
+        treeSize: sth.tree_size,
+        rootBlake3: sth.root,
+        rootSha3: sth.root_sha3,
+        ts: sth.ts,
+      });
+      return signSTHQuorum(canon);
+    })() : null,
     operator: {
       ed25519_pubkey: operatorPublicKey ? toHex(operatorPublicKey) : null,
       pq_pubkey: operatorPqPublicKey ? toHex(operatorPqPublicKey) : null,
@@ -323,7 +344,26 @@ app.get('/v1/proof-bundle/:leaf_hash', async (req, reply) => {
       patent_filed: '2026-05-08',
       inventor: 'Steve Rotzin',
       assignee: 'Hive Civilization, Inc.',
-      notice: 'The cryptographic transparency log architecture, the dual ed25519 + ML-DSA-65 STH co-signature, the dual-hash (BLAKE3 + SHA3-256) hash-agile Merkle commitment, the BLAKE3 leaf/internal domain-separated commitment scheme, the receipt-envelope canonical encoding, the multi-axis physical-entropy lattice handshake, and the self-verifying offline proof-bundle format are original work by Steve Rotzin. Patent Pending. Filed 2026-05-08.',
+      notice: 'The cryptographic transparency log architecture, the dual ed25519 + ML-DSA-65 STH co-signature, the dual-hash (BLAKE3 + SHA3-256) hash-agile Merkle commitment, the BLAKE3 leaf/internal domain-separated commitment scheme, the receipt-envelope canonical encoding, the multi-axis physical-entropy lattice handshake, the PQ witness gossip quorum (hybrid Q-of-N), and the self-verifying offline proof-bundle format are original work by Steve Rotzin. Patent Pending. Filed 2026-05-08.',
+    },
+  };
+});
+
+// Vector 3 — witness pubkey discovery. Public endpoint so any verifier can
+// fetch the canonical witness identity set out-of-band and check bundles
+// without trusting the bundle itself for the pubkeys.
+app.get('/.well-known/ct-witnesses', async (req, reply) => {
+  reply.header('cache-control', 'public, max-age=60');
+  return {
+    scheme: WITNESS_QUORUM_SCHEME,
+    threshold: 2,
+    witnesses: getWitnessPubkeys(),
+    canonical_encoding: 'epoch(8) || tree_size(8) || root_blake3(32) || root_sha3_256(32) || ts(8), big-endian',
+    ip: {
+      patent_status: 'Patent Pending',
+      patent_filed: '2026-05-08',
+      inventor: 'Steve Rotzin',
+      assignee: 'Hive Civilization, Inc.',
     },
   };
 });
@@ -936,6 +976,14 @@ app.get('/v1/lattice/:name/handshake', async (req, reply) => {
 });
 
 // --- Start ---
+// Initialize the witness quorum keys (in-process pseudo-witnesses for now).
+const _wpubs = getWitnessPubkeys();
+app.log.info({
+  witnesses: _wpubs.map(w => ({ name: w.name, ed25519: w.ed25519_pubkey.slice(0, 16), ml_dsa_65_bytes: w.ml_dsa_65_pubkey_bytes })),
+  threshold: 2,
+  n: _wpubs.length,
+}, 'witness quorum initialized');
+
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`ct-log listening on :${PORT}, STH cadence ${STH_CADENCE_MS}ms`);
 });

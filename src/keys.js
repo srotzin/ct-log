@@ -61,7 +61,7 @@ export function signBytesPQ(canonicalBytes) {
 // This is signed in parallel to the legacy single-root STH so any party
 // can verify either commitment independently.
 
-function encodeSTHDual({ epoch, treeSize, rootBlake3, rootSha3, ts }) {
+export function encodeSTHDual({ epoch, treeSize, rootBlake3, rootSha3, ts }) {
   const buf = Buffer.alloc(8 + 8 + 32 + 32 + 8);
   buf.writeBigUInt64BE(BigInt(epoch), 0);
   buf.writeBigUInt64BE(BigInt(treeSize), 8);
