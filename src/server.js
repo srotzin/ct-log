@@ -3,6 +3,7 @@
 //   GET  /v1/sth
 //   POST /v1/submit
 //   GET  /v1/proof/:leaf_hash
+//   GET  /v1/proof-bundle/:leaf_hash   (self-contained, offline-verifiable: receipt + merkle path + STH + dual sigs + pubkeys)
 //   GET  /v1/consistency?from=:size1&to=:size2
 //   GET  /v1/entries?start=:n&end=:m
 //   GET  /v1/vestigium/:did
@@ -199,6 +200,57 @@ app.get('/v1/proof/:leaf_hash', async (req, reply) => {
     tree_size: treeSize,
     proof: proof.map(p => toHex(p)),
     sth: { epoch: sth.epoch, tree_size: sth.tree_size, root: toHex(sth.root), ts: sth.ts, sig: toHex(sth.sig) },
+  };
+});
+
+// Self-verifying PQ proof bundle. Everything needed to verify a receipt's inclusion + STH dual-sig
+// in ONE JSON blob, no further network calls. Use with scripts/verify-bundle.mjs.
+app.get('/v1/proof-bundle/:leaf_hash', async (req, reply) => {
+  const { leaf_hash } = req.params;
+  if (!/^[0-9a-f]{64}$/i.test(leaf_hash)) {
+    return reply.code(400).send({ error: 'leaf_hash must be 32-byte hex' });
+  }
+  const leafBuf = Buffer.from(leaf_hash, 'hex');
+  const entry = stmts.getEntryByHash.get(leafBuf);
+  if (!entry) return reply.code(404).send({ error: 'leaf not found' });
+  const sth = stmts.latestTreeHead.get();
+  if (!sth) return reply.code(503).send({ error: 'no STH yet' });
+  if (entry.seq > sth.tree_size) {
+    return reply.code(409).send({ error: 'leaf not yet in published STH' });
+  }
+  const proof = inclusionProof(leafCache.slice(0, sth.tree_size), entry.seq - 1);
+  return {
+    bundle_version: 1,
+    log_name: 'hive-ct-v1',
+    leaf_hash,
+    seq: entry.seq,
+    index: entry.seq - 1,
+    receipt_envelope_b64: Buffer.from(entry.payload).toString('base64'),
+    merkle: {
+      tree_size: sth.tree_size,
+      proof: proof.map(p => toHex(p)),
+      leaf_hash_scheme: 'BLAKE3(0x00 || payload_bytes)',
+      node_hash_scheme: 'BLAKE3(0x01 || left || right)',
+    },
+    sth: {
+      epoch: sth.epoch,
+      tree_size: sth.tree_size,
+      root: toHex(sth.root),
+      ts: sth.ts,
+      canonical_encoding: 'epoch(8) || tree_size(8) || root(32) || ts(8), big-endian',
+      ed25519_sig: toHex(sth.sig),
+      pq_sig: sth.pq_sig ? toHex(sth.pq_sig) : null,
+      pq_scheme: sth.pq_sig ? operatorPqScheme : null,
+    },
+    operator: {
+      ed25519_pubkey: operatorPublicKey ? toHex(operatorPublicKey) : null,
+      pq_pubkey: operatorPqPublicKey ? toHex(operatorPqPublicKey) : null,
+      pq_scheme: operatorPqScheme,
+    },
+    verifier: {
+      hint: 'node verify-bundle.mjs <path-to-bundle.json> -- offline, no network',
+      source: 'https://github.com/srotzin/hive-protocol/blob/main/ct-log/scripts/verify-bundle.mjs',
+    },
   };
 });
 
