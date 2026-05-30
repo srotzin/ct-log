@@ -201,12 +201,43 @@ async function entropyKeystone() {
   };
 }
 
+// Nano-Band Lattice — NIST Randomness Beacon v2.0 (pulse-chain randomness).
+// Substrate: 60-second pulses, RSA-signed by NIST, each pulse commits to the
+// previous one. Used as the entropy floor for value-banded nano payments —
+// every batch root commits to the current beacon pulse, so even amortized
+// dust receipts inherit fresh public randomness.
+async function entropyNanoBand() {
+  const url = 'https://beacon.nist.gov/beacon/2.0/pulse/last';
+  const j = await fetchJSON(url, 8000);
+  const p = j.pulse;
+  return {
+    lattice: 'nano-band',
+    source_name: 'NIST Randomness Beacon v2.0 (Interoperable Beacon)',
+    source_url: url,
+    source_protocol: 'NIST Beacon v2.0 REST · RSA-signed pulse chain',
+    records: [{
+      chain_index: p.chainIndex,
+      pulse_index: p.pulseIndex,
+      timestamp: p.timeStamp,
+      period_ms: p.period,
+      output_value: p.outputValue,
+      local_random_value: p.localRandomValue,
+      precommitment_value: p.precommitmentValue,
+      previous_uri: (p.listValues || []).find(v => v.type === 'previous')?.uri,
+      previous_value: (p.listValues || []).find(v => v.type === 'previous')?.value,
+      status_code: p.statusCode,
+    }],
+    record_count: 1,
+  };
+}
+
 const LATTICES = {
   wave: entropyWave,
   loess: entropyLoess,
   aurora: entropyAurora,
   'rogue-wave': entropyRogueWave,
   keystone: entropyKeystone,
+  'nano-band': entropyNanoBand,
 };
 
 export const LATTICE_NAMES = Object.keys(LATTICES);
