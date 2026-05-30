@@ -39,28 +39,26 @@ function concat(...arrs) {
 function hashLeaf(payload) { return blake3(concat(LEAF_PREFIX, payload)); }
 function hashNode(l, r)    { return blake3(concat(NODE_PREFIX, l, r)); }
 
-// RFC 6962-style inclusion verify (matches ct-log/src/merkle.js).
+// Inclusion verify — mirrors the recursive proof construction in ct-log/src/merkle.js.
+// Proof is pushed outer-split-first (root-side) during construction, so we recurse
+// the same way and consume proof[depth] at each level.
 function verifyInclusion(leafHash, index, treeSize, proofHexes, rootHex) {
-  let h = leafHash;
-  let m = index;
-  let n = treeSize;
   const proof = proofHexes.map(fromHex);
-  let i = 0;
-  while (n > 1) {
+  function recurse(lo, hi, idx, depth) {
+    if (hi - lo === 1) return leafHash;
     let k = 1;
-    while (k * 2 < n) k *= 2;
-    const sib = proof[proof.length - 1 - i];
-    if (m < k) {
-      h = hashNode(h, sib);
-      n = k;
+    while (k * 2 < hi - lo) k *= 2;
+    const sib = proof[depth];
+    if (idx < lo + k) {
+      const left = recurse(lo, lo + k, idx, depth + 1);
+      return hashNode(left, sib);
     } else {
-      h = hashNode(sib, h);
-      m = m - k;
-      n = n - k;
+      const right = recurse(lo + k, hi, idx, depth + 1);
+      return hashNode(sib, right);
     }
-    i++;
   }
-  return toHex(h) === rootHex;
+  const computed = recurse(0, treeSize, index, 0);
+  return toHex(computed) === rootHex;
 }
 
 function encodeSTH({ epoch, tree_size, root, ts }) {
