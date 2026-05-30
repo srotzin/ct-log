@@ -1,25 +1,42 @@
 #!/usr/bin/env bash
-# Hive · Circle counterparty attestation
+# Hive counterparty attestation
 # One command. Generates an ephemeral Ed25519 key on your machine,
-# signs the current Hive treasury attestation blob, lands it in the public log.
+# signs a fresh receipt envelope, lands it in the public Hive transparency log.
+# The receipt extends YOUR vestigium under the DID you choose.
 # No persistent state. No network calls except to Hive.
 #
-# Run: curl -sSL https://ct.thehiveryiq.com/sign | bash
-# Or:  curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh | bash
+# Default (counterparty=test):
+#   curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh | bash
+#
+# Custom short name (gives did:<name>:test):
+#   COUNTERPARTY=circle curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh | bash
+#
+# Full DID override (gives whatever DID you declare, e.g. did:agent:kimi-k2):
+#   DID=did:agent:kimi-k2 curl -sSL https://raw.githubusercontent.com/srotzin/ct-log/master/scripts/circle-attest.sh | bash
 
 set -euo pipefail
 
 CT_LOG="${CT_LOG_URL:-https://ct-log.onrender.com}"
-COUNTERPARTY="${COUNTERPARTY:-circle}"
+COUNTERPARTY="${COUNTERPARTY:-test}"
+DID="${DID:-}"
+
+if [ -n "$DID" ]; then
+  PREFILL_URL="${CT_LOG}/v1/attest/prefill?did=${DID}"
+  LABEL="$DID"
+else
+  PREFILL_URL="${CT_LOG}/v1/attest/prefill?counterparty=${COUNTERPARTY}"
+  LABEL="did:${COUNTERPARTY}:test"
+fi
 
 echo ""
 echo "=================================================="
-echo "  Hive Counterparty Attestation · ${COUNTERPARTY}"
+echo "  Hive Counterparty Attestation"
+echo "  Signing as: ${LABEL}"
 echo "=================================================="
 echo ""
 echo "Step 1: Fetching prefilled receipt envelope from ${CT_LOG}"
 
-PREFILL=$(curl -fsS "${CT_LOG}/v1/attest/prefill?counterparty=${COUNTERPARTY}")
+PREFILL=$(curl -fsS "$PREFILL_URL")
 if [ -z "$PREFILL" ]; then
   echo "Failed to fetch prefill."
   exit 1
@@ -43,7 +60,9 @@ canonical = prefill["canonical_json"]
 canonical_bytes = base64.b64decode(prefill["canonical_bytes_b64"])
 
 print("")
-print(f"  Counterparty DID:  {canonical['counterparty_did']}")
+print(f"  Signing as (DID):  {canonical['agent_did']}")
+print(f"  Prior depth:       {prefill['prev_depth']}")
+print(f"  Depth after land:  {prefill['new_depth_if_landed']}")
 print(f"  Anchored to STH:   epoch {prefill['sth']['epoch']}, tree_size {prefill['sth']['tree_size']}")
 print(f"  STH root:          {prefill['sth']['root'][:32]}...")
 print(f"  BLAKE3 of bytes:   {prefill['blake3_hex'][:32]}...")
@@ -117,10 +136,11 @@ print("")
 print("==================================================")
 print("  ATTESTATION LANDED")
 print("==================================================")
-print(f"  Counterparty DID:  {result['counterparty_did']}")
+print(f"  Agent DID:         {result['agent_did']}")
+print(f"  Vestigium depth:   {result['vestigium_depth']}")
+print(f"  Witness (Hive):    {result['witness_did']}")
 print(f"  Receipt seq:       {result['seq']}")
 print(f"  Receipt hash:      {result['leaf_hash']}")
-print(f"  Treasury depth:    {result['treasury_vestigium_depth']}")
 print(f"  Anchored STH:      epoch {result['sth']['epoch']}, tree_size {result['sth']['tree_size']}")
 print(f"  Inclusion proof:   {CT_LOG}{result['receipt_url']}")
 print(f"  Next STH in:       {result['next_sth_in_ms']/1000:.0f}s (then receipt is in a signed root)")

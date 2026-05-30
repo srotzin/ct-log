@@ -281,49 +281,73 @@ app.get('/v1/vestigium/:did/chain', async (req, reply) => {
 // --- Attestation endpoints (for one-line counterparty signing) ---
 
 // Build a pre-filled receipt envelope for a counterparty to sign.
-// Usage: GET /v1/attest/prefill?counterparty=circle  (or visa, aave, openai, etc.)
+// The receipt extends the COUNTERPARTY's vestigium — they sign as principal,
+// the treasury co-signs as witness. Counterparty depth increments by one.
+//
+// Usage:
+//   GET /v1/attest/prefill?counterparty=circle
+//     -> agent_did = did:circle:test
+//   GET /v1/attest/prefill?did=did:agent:kimi-k2
+//     -> agent_did = did:agent:kimi-k2 (full DID override)
 app.get('/v1/attest/prefill', async (req, reply) => {
-  const counterparty = String(req.query.counterparty || 'test').toLowerCase().replace(/[^a-z0-9-]/g, '');
-  if (!counterparty || counterparty.length > 32) {
-    return reply.code(400).send({ error: 'bad counterparty name' });
-  }
-
   const TREASURY_DID = 'did:hive:treasury-001';
-  const counterparty_did = `did:${counterparty}:test`;
+
+  // Two modes: full DID override (?did=did:agent:kimi-k2) or short counterparty name (?counterparty=circle)
+  let counterparty_did;
+  if (req.query.did) {
+    const did = String(req.query.did).trim();
+    if (!/^did:[a-z0-9]+:[a-zA-Z0-9._-]+$/.test(did) || did.length > 128) {
+      return reply.code(400).send({ error: 'bad did format; expected did:method:identifier' });
+    }
+    if (did === TREASURY_DID) {
+      return reply.code(400).send({ error: 'treasury did is reserved for operator co-signature' });
+    }
+    counterparty_did = did;
+  } else {
+    const counterparty = String(req.query.counterparty || 'test').toLowerCase().replace(/[^a-z0-9-]/g, '');
+    if (!counterparty || counterparty.length > 32) {
+      return reply.code(400).send({ error: 'bad counterparty name' });
+    }
+    counterparty_did = `did:${counterparty}:test`;
+  }
 
   // Anchor to current STH.
   const sth = stmts.latestTreeHead.get();
   if (!sth) return reply.code(503).send({ error: 'no STH yet' });
 
-  // Treasury's current head.
-  const treasuryHead = stmts.latestVestigium.get(TREASURY_DID);
-  const prev_receipt_hash = treasuryHead ? toHex(treasuryHead.leaf_hash) : '0'.repeat(64);
+  // COUNTERPARTY's current vestigium head — receipt extends THEIR chain.
+  const cpHead = stmts.latestVestigium.get(counterparty_did);
+  const prev_receipt_hash = cpHead ? toHex(cpHead.leaf_hash) : '0'.repeat(64);
+  const prev_depth = cpHead ? cpHead.depth : 0;
 
   const ts = Date.now();
-  const input_commit = toHex(blake3(`hive-${counterparty}-attestation-${ts}`));
+  const did_label = counterparty_did.split(':').slice(1).join('-');
+  const input_commit = toHex(blake3(`hive-${did_label}-attestation-${ts}`));
   const output_commit = toHex(blake3('counterparty-attestation-acknowledged'));
 
   const canonical = {
     v: 1,
-    agent_did: TREASURY_DID,
+    agent_did: counterparty_did,
     prev_receipt_hash,
     log_sth_root: toHex(sth.root),
     log_sth_size: sth.tree_size,
-    action_type: 'settlement',
+    action_type: 'attestation',
     input_commit,
     output_commit,
-    counterparty_did,
+    witness_did: TREASURY_DID,
     ts,
   };
   const canonicalBytes = Buffer.from(JSON.stringify(canonical));
   return {
     counterparty_did,
+    prev_depth,
+    new_depth_if_landed: prev_depth + 1,
     canonical_json: canonical,
     canonical_bytes_b64: canonicalBytes.toString('base64'),
     canonical_bytes_utf8: canonicalBytes.toString('utf8'),
     blake3_hex: toHex(blake3(canonicalBytes)),
     sth: { epoch: sth.epoch, tree_size: sth.tree_size, root: toHex(sth.root), ts: sth.ts },
-    instructions: 'Sign canonical_bytes_b64 (decoded to raw bytes) with any Ed25519 key. POST {prefill_id, counterparty_pubkey_hex, counterparty_sig_hex, canonical_json} to /v1/attest/submit. Or use the one-line script at /sign.',
+    instructions: 'Sign canonical_bytes_b64 (decoded to raw bytes) with any Ed25519 key. POST {canonical_bytes_b64, counterparty_pubkey_hex, counterparty_sig_hex} to /v1/attest/submit. The receipt will extend YOUR vestigium under agent_did. Or use the one-line script at /sign.',
   };
 });
 
@@ -380,12 +404,13 @@ app.post('/v1/attest/submit', async (req, reply) => {
     agent_pubkey_hex = Buffer.from(treasuryPub).toString('hex');
   }
 
+  // The counterparty signed as the principal (agent_did). Treasury co-signs as witness.
   const fullReceipt = {
     ...canonical_json,
-    counterparty_sig: counterparty_sig_hex,
-    counterparty_pubkey: counterparty_pubkey_hex,
-    agent_sig: agent_sig_hex,
-    agent_pubkey: agent_pubkey_hex,
+    agent_sig: counterparty_sig_hex,
+    agent_pubkey: counterparty_pubkey_hex,
+    witness_sig: agent_sig_hex,
+    witness_pubkey: agent_pubkey_hex,
   };
 
   const payload = Buffer.from(JSON.stringify(fullReceipt));
@@ -412,8 +437,10 @@ app.post('/v1/attest/submit', async (req, reply) => {
     ok: true,
     seq,
     leaf_hash: toHex(leaf),
-    counterparty_did: canonical_json.counterparty_did,
-    treasury_vestigium_depth: newDepth,
+    agent_did: canonical_json.agent_did,
+    counterparty_did: canonical_json.agent_did,
+    witness_did: canonical_json.witness_did,
+    vestigium_depth: newDepth,
     sth: sth ? { epoch: sth.epoch, tree_size: sth.tree_size, root: toHex(sth.root), ts: sth.ts, sig: toHex(sth.sig) } : null,
     next_sth_in_ms: STH_CADENCE_MS,
     receipt_url: `/v1/proof/${toHex(leaf)}`,
