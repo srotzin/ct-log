@@ -25,6 +25,7 @@ import {
 } from './merkle.js';
 import { operatorPublicKey, signSTH, operatorPqPublicKey, operatorPqScheme, signSTHPQ, signBytesPQ } from './keys.js';
 import { tryParseReceipt } from './receipt.js';
+import { fetchLatticeEntropy, LATTICE_NAMES, deriveLatticeKey, signWithLatticeKey } from './entropy.js';
 import * as ed from '@noble/ed25519';
 import { sha512 } from '@noble/hashes/sha512';
 import { blake3 } from '@noble/hashes/blake3';
@@ -503,6 +504,198 @@ app.post('/v1/attest/submit', async (req, reply) => {
     next_sth_in_ms: STH_CADENCE_MS,
     receipt_url: `/v1/proof/${toHex(leaf)}`,
   };
+});
+
+// --- Lattice entropy handshake ------------------------------------------
+//
+// Each lattice has a real public-data feed it draws entropy from. The
+// handshake endpoint fetches that feed, mints a receipt under
+// did:lattice:<name>, embeds the entropy digest and source URL in the
+// canonical envelope, signs with a deterministic per-lattice Ed25519 key
+// (operator-bound), and operator co-signs Ed25519 + ML-DSA-65 (FIPS 204).
+//
+// Anyone can: re-fetch the source URL, recompute the digest, and verify
+// both signatures against the public pubkeys. Provably PQ at the signature
+// layer, real-world entropy at the substrate layer.
+
+const LATTICE_DESCRIPTIONS = {
+  wave: 'Wave-Lattice — entropy from NOAA NDBC ocean buoy wave height, period, and direction.',
+  loess: 'Loess-Lattice — entropy from USGS global seismic activity feed (M2.5+).',
+  aurora: 'Aurora-Lattice — entropy from NOAA SWPC planetary K-index (geomagnetic activity).',
+  'rogue-wave': 'RogueWave-Lattice — entropy from NOAA Tides & Currents water-level anomalies.',
+  keystone: 'Keystone-Lattice — entropy from Base mainnet validator-produced block hash.',
+};
+
+app.get('/v1/lattice/list', async () => ({
+  lattices: LATTICE_NAMES.map(name => ({
+    name,
+    did: `did:lattice:${name}`,
+    description: LATTICE_DESCRIPTIONS[name],
+    handshake_url: `/v1/lattice/${name}/handshake`,
+  })),
+  operator_pq_scheme: operatorPqScheme,
+  operator_pq_pubkey: operatorPqPublicKey ? toHex(operatorPqPublicKey) : null,
+}));
+
+app.post('/v1/lattice/:name/handshake', async (req, reply) => {
+  const name = String(req.params.name || '').toLowerCase();
+  if (!LATTICE_NAMES.includes(name)) {
+    return reply.code(404).send({ error: 'unknown lattice', known: LATTICE_NAMES });
+  }
+  const PQ_SEED = process.env.LOG_OPERATOR_PQ_SEED;
+  if (!PQ_SEED) return reply.code(503).send({ error: 'operator PQ seed not configured' });
+
+  // 1. Fetch real entropy from the lattice's substrate.
+  let entropy;
+  try { entropy = await fetchLatticeEntropy(name); }
+  catch (e) { return reply.code(502).send({ error: 'entropy fetch failed', detail: e.message }); }
+
+  // 2. Derive the lattice's stable per-lattice Ed25519 agent key.
+  const kp = deriveLatticeKey(PQ_SEED, name);
+  const lattice_did = `did:lattice:${name}`;
+
+  // 3. Anchor to current STH.
+  const sth = stmts.latestTreeHead.get();
+  if (!sth) return reply.code(503).send({ error: 'no STH yet' });
+
+  // 4. Lattice's own vestigium head.
+  const head = stmts.latestVestigium.get(lattice_did);
+  const prev_receipt_hash = head ? toHex(head.leaf_hash) : '0'.repeat(64);
+  const prev_depth = head ? head.depth : 0;
+
+  const ts = Date.now();
+  const input_commit = entropy.entropy_digest_hex;
+  const output_commit = toHex(blake3(Buffer.from(`lattice-handshake-${name}-${ts}`)));
+
+  // 5. Canonical envelope. Embed the entropy data + provenance.
+  const canonical = {
+    v: 1,
+    agent_did: lattice_did,
+    prev_receipt_hash,
+    log_sth_root: toHex(sth.root),
+    log_sth_size: sth.tree_size,
+    action_type: 'lattice-entropy-handshake',
+    input_commit,
+    output_commit,
+    witness_did: 'did:hive:treasury-001',
+    ts,
+    lattice: {
+      name,
+      source_name: entropy.body.source_name,
+      source_url: entropy.body.source_url,
+      source_protocol: entropy.body.source_protocol,
+      entropy_digest: entropy.entropy_digest_hex,
+      entropy_records: entropy.body.records,
+      record_count: entropy.body.record_count,
+      fetched_ms: entropy.fetched_ms,
+      audit_note: 'Re-fetch source_url, normalize per source_protocol, BLAKE3 of canonical JSON must equal entropy_digest.',
+    },
+  };
+  const canonicalBytes = Buffer.from(JSON.stringify(canonical));
+
+  // 6. Sign with the per-lattice Ed25519 agent key.
+  const agentSig = signWithLatticeKey(canonicalBytes, kp.priv);
+  const agent_sig_hex = Buffer.from(agentSig).toString('hex');
+  const agent_pubkey_hex = Buffer.from(kp.pub).toString('hex');
+
+  // 7. Treasury Ed25519 witness co-sig.
+  let witness_sig_hex = 'unsigned', witness_pubkey_hex = null;
+  const treasuryPrivHex = process.env.TREASURY_AGENT_PRIVATE_KEY;
+  if (treasuryPrivHex) {
+    const treasuryPriv = new Uint8Array(Buffer.from(treasuryPrivHex, 'hex'));
+    const treasuryPub = ed.getPublicKey(treasuryPriv);
+    const ws = await ed.sign(canonicalBytes, treasuryPriv);
+    witness_sig_hex = Buffer.from(ws).toString('hex');
+    witness_pubkey_hex = Buffer.from(treasuryPub).toString('hex');
+  }
+
+  // 8. Operator ML-DSA-65 PQ co-sig on the SAME canonical bytes.
+  let operator_pq_sig_hex = null, operator_pq_pubkey_hex = null, pq_scheme_used = null;
+  if (operatorPqPublicKey) {
+    const pqSig = signBytesPQ(canonicalBytes);
+    if (pqSig) {
+      operator_pq_sig_hex = Buffer.from(pqSig).toString('hex');
+      operator_pq_pubkey_hex = toHex(operatorPqPublicKey);
+      pq_scheme_used = operatorPqScheme;
+    }
+  }
+
+  const fullReceipt = {
+    ...canonical,
+    agent_sig: agent_sig_hex,
+    agent_pubkey: agent_pubkey_hex,
+    witness_sig: witness_sig_hex,
+    witness_pubkey: witness_pubkey_hex,
+    operator_pq_sig: operator_pq_sig_hex,
+    operator_pq_pubkey: operator_pq_pubkey_hex,
+    pq_scheme: pq_scheme_used,
+  };
+
+  // 9. Land on the log.
+  const payload = Buffer.from(JSON.stringify(fullReceipt));
+  const leaf = hashLeaf(payload);
+  const leafBuf = Buffer.from(leaf);
+  const existing = stmts.getEntryByHash.get(leafBuf);
+  if (existing) {
+    return { duplicate: true, seq: existing.seq, leaf_hash: toHex(leaf) };
+  }
+  const prevHashBuf = prev_receipt_hash === '0'.repeat(64) ? null : Buffer.from(prev_receipt_hash, 'hex');
+  const info = stmts.insertEntry.run(leafBuf, payload, lattice_did, prevHashBuf, 'lattice-entropy-handshake', ts);
+  const seq = info.lastInsertRowid;
+  leafCache.push(leaf);
+  const newDepth = prev_depth + 1;
+  stmts.insertVestigium.run(lattice_did, newDepth, seq, leafBuf, prevHashBuf, ts);
+
+  const nextSth = stmts.latestTreeHead.get();
+  return {
+    ok: true,
+    lattice: name,
+    lattice_did,
+    seq,
+    leaf_hash: toHex(leaf),
+    vestigium_depth: newDepth,
+    entropy: {
+      source_name: entropy.body.source_name,
+      source_url: entropy.body.source_url,
+      source_protocol: entropy.body.source_protocol,
+      digest_blake3: entropy.entropy_digest_hex,
+      record_count: entropy.body.record_count,
+      fetched_ms: entropy.fetched_ms,
+    },
+    signatures: {
+      agent_ed25519_sig: agent_sig_hex,
+      agent_ed25519_pubkey: agent_pubkey_hex,
+      witness_ed25519_sig: witness_sig_hex,
+      witness_ed25519_pubkey: witness_pubkey_hex,
+      operator_pq_sig: operator_pq_sig_hex,
+      operator_pq_pubkey: operator_pq_pubkey_hex,
+      pq_scheme: pq_scheme_used,
+      pq_sig_bytes: operator_pq_sig_hex ? operator_pq_sig_hex.length / 2 : 0,
+    },
+    sth: nextSth ? {
+      epoch: nextSth.epoch,
+      tree_size: nextSth.tree_size,
+      root: toHex(nextSth.root),
+      ts: nextSth.ts,
+      sig: toHex(nextSth.sig),
+      pq_sig: nextSth.pq_sig ? toHex(nextSth.pq_sig) : null,
+      pq_scheme: nextSth.pq_sig ? operatorPqScheme : null,
+    } : null,
+    verify: {
+      vestigium_url: `/v1/vestigium/${lattice_did}`,
+      proof_url: `/v1/proof/${toHex(leaf)}`,
+      pq_pubkey_url: '/.well-known/ct-pq-pubkey',
+    },
+    next_sth_in_ms: STH_CADENCE_MS,
+  };
+});
+
+// Convenience GET that does the same handshake — easier to share as a link.
+app.get('/v1/lattice/:name/handshake', async (req, reply) => {
+  return app.inject({ method: 'POST', url: `/v1/lattice/${req.params.name}/handshake` }).then(r => {
+    reply.code(r.statusCode);
+    return JSON.parse(r.payload);
+  });
 });
 
 // --- Start ---
