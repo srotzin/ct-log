@@ -18,6 +18,7 @@
 
 import { readFileSync } from 'node:fs';
 import { blake3 } from '@noble/hashes/blake3';
+import { sha3_256 } from '@noble/hashes/sha3';
 import { sha512 } from '@noble/hashes/sha512';
 import * as ed from '@noble/ed25519';
 import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
@@ -38,11 +39,14 @@ function concat(...arrs) {
 
 function hashLeaf(payload) { return blake3(concat(LEAF_PREFIX, payload)); }
 function hashNode(l, r)    { return blake3(concat(NODE_PREFIX, l, r)); }
+function hashLeafSha3(payload) { return sha3_256(concat(LEAF_PREFIX, payload)); }
+function hashNodeSha3(l, r)    { return sha3_256(concat(NODE_PREFIX, l, r)); }
 
 // Inclusion verify — mirrors the recursive proof construction in ct-log/src/merkle.js.
 // Proof is pushed outer-split-first (root-side) during construction, so we recurse
-// the same way and consume proof[depth] at each level.
-function verifyInclusion(leafHash, index, treeSize, proofHexes, rootHex) {
+// the same way and consume proof[depth] at each level. nodeHash is parameterised
+// so the same routine works for BLAKE3 or SHA3-256.
+function verifyInclusionWith(nodeHash, leafHash, index, treeSize, proofHexes, rootHex) {
   const proof = proofHexes.map(fromHex);
   function recurse(lo, hi, idx, depth) {
     if (hi - lo === 1) return leafHash;
@@ -51,14 +55,20 @@ function verifyInclusion(leafHash, index, treeSize, proofHexes, rootHex) {
     const sib = proof[depth];
     if (idx < lo + k) {
       const left = recurse(lo, lo + k, idx, depth + 1);
-      return hashNode(left, sib);
+      return nodeHash(left, sib);
     } else {
       const right = recurse(lo + k, hi, idx, depth + 1);
-      return hashNode(sib, right);
+      return nodeHash(sib, right);
     }
   }
   const computed = recurse(0, treeSize, index, 0);
   return toHex(computed) === rootHex;
+}
+function verifyInclusion(leafHash, index, treeSize, proofHexes, rootHex) {
+  return verifyInclusionWith(hashNode, leafHash, index, treeSize, proofHexes, rootHex);
+}
+function verifyInclusionSha3(leafHash, index, treeSize, proofHexes, rootHex) {
+  return verifyInclusionWith(hashNodeSha3, leafHash, index, treeSize, proofHexes, rootHex);
 }
 
 function encodeSTH({ epoch, tree_size, root, ts }) {
@@ -67,6 +77,16 @@ function encodeSTH({ epoch, tree_size, root, ts }) {
   buf.writeBigUInt64BE(BigInt(tree_size), 8);
   Buffer.from(root, 'hex').copy(buf, 16);
   buf.writeBigUInt64BE(BigInt(ts), 48);
+  return new Uint8Array(buf);
+}
+
+function encodeSTHDual({ epoch, tree_size, root_blake3, root_sha3_256, ts }) {
+  const buf = Buffer.alloc(8 + 8 + 32 + 32 + 8);
+  buf.writeBigUInt64BE(BigInt(epoch), 0);
+  buf.writeBigUInt64BE(BigInt(tree_size), 8);
+  Buffer.from(root_blake3, 'hex').copy(buf, 16);
+  Buffer.from(root_sha3_256, 'hex').copy(buf, 48);
+  buf.writeBigUInt64BE(BigInt(ts), 80);
   return new Uint8Array(buf);
 }
 
@@ -128,17 +148,68 @@ async function main() {
   }
   checks.push([`STH ${bundle.sth.pq_scheme || 'ML-DSA-65'} sig (post-quantum, FIPS 204)`, pqOk, pqInfo]);
 
+  // ---- Hash agility (Vector 1): independent SHA3-256 verification path ----
+  if (bundle.merkle_sha3 && bundle.sth_dual) {
+    // 5. SHA3-256 leaf hash matches
+    const computedSha3Leaf = toHex(hashLeafSha3(payload));
+    const sha3LeafOk = computedSha3Leaf === bundle.merkle_sha3.leaf_hash;
+    checks.push(['SHA3-256 leaf = SHA3-256(0x00 || envelope_bytes)', sha3LeafOk,
+      sha3LeafOk ? '(NIST-aligned hash)' : `(got ${computedSha3Leaf.slice(0,16)}...)`]);
+
+    // 6. SHA3-256 Merkle inclusion against root_sha3_256
+    const sha3IncOk = verifyInclusionSha3(
+      fromHex(bundle.merkle_sha3.leaf_hash),
+      bundle.index,
+      bundle.merkle_sha3.tree_size,
+      bundle.merkle_sha3.proof,
+      bundle.sth_dual.root_sha3_256,
+    );
+    checks.push([`SHA3-256 Merkle inclusion @ index ${bundle.index} / tree_size ${bundle.merkle_sha3.tree_size}`, sha3IncOk,
+      `(${bundle.merkle_sha3.proof.length} sibling hashes)`]);
+
+    // 7. Dual-root ed25519 STH signature (commits to BOTH roots)
+    const sthDualBytes = encodeSTHDual({
+      epoch: bundle.sth.epoch,
+      tree_size: bundle.sth.tree_size,
+      root_blake3: bundle.sth_dual.root_blake3,
+      root_sha3_256: bundle.sth_dual.root_sha3_256,
+      ts: bundle.sth.ts,
+    });
+    let dualEdOk = false;
+    try {
+      dualEdOk = bundle.sth_dual.ed25519_sig && bundle.operator.ed25519_pubkey
+        ? ed.verify(fromHex(bundle.sth_dual.ed25519_sig), sthDualBytes, fromHex(bundle.operator.ed25519_pubkey))
+        : false;
+    } catch (_) { dualEdOk = false; }
+    checks.push(['Dual-root STH ed25519 sig (commits BLAKE3 + SHA3-256)', dualEdOk, '(hash agility)']);
+
+    // 8. Dual-root ML-DSA-65 STH signature
+    let dualPqOk = false, dualPqInfo = '(absent)';
+    if (bundle.sth_dual.pq_sig && bundle.operator.pq_pubkey) {
+      try {
+        dualPqOk = ml_dsa65.verify(fromHex(bundle.sth_dual.pq_sig), sthDualBytes, fromHex(bundle.operator.pq_pubkey));
+        dualPqInfo = `(${bundle.sth_dual.pq_scheme}, sig bytes=${fromHex(bundle.sth_dual.pq_sig).length})`;
+      } catch (e) { dualPqOk = false; dualPqInfo = `(verify error: ${e.message})`; }
+    }
+    checks.push([`Dual-root STH ${bundle.sth_dual.pq_scheme || 'ML-DSA-65'} sig (post-quantum + hash-agile)`, dualPqOk, dualPqInfo]);
+  }
+
   for (const [label, ok, extra] of checks) console.log(fmt(label, ok, extra));
   console.log('');
 
   const allOk = checks.every(([, ok]) => ok);
   if (allOk) {
     console.log('  ALL CHECKS PASS  ::  bundle is cryptographically valid offline.');
-    process.exit(0);
   } else {
     console.log('  FAILED  ::  one or more checks did not verify.');
-    process.exit(1);
   }
+
+  if (bundle.ip) {
+    console.log('');
+    console.log(`  IP  ::  ${bundle.ip.patent_status} · Filed ${bundle.ip.patent_filed} · ${bundle.ip.inventor} / ${bundle.ip.assignee}`);
+  }
+
+  process.exit(allOk ? 0 : 1);
 }
 
 main().catch(e => { console.error('verifier crashed:', e); process.exit(2); });

@@ -1,8 +1,14 @@
 // RFC 6962-style Merkle tree over BLAKE3.
 // Domain separation: leaf prefix 0x00, internal prefix 0x01.
 // Used for the global CT log and the per-agent vestigium accumulator.
+//
+// Hash agility (Vector 1): a parallel SHA3-256 Merkle tree is published
+// alongside the BLAKE3 tree, with identical structure but SHA3-256 used
+// at every step. NIST-only stacks can verify against root_sha3 without
+// pulling in BLAKE3.
 
 import { blake3 } from '@noble/hashes/blake3';
+import { sha3_256 } from '@noble/hashes/sha3';
 
 const LEAF_PREFIX = new Uint8Array([0x00]);
 const NODE_PREFIX = new Uint8Array([0x01]);
@@ -115,4 +121,44 @@ export function toHex(u8) {
 }
 export function fromHex(s) {
   return new Uint8Array(Buffer.from(s, 'hex'));
+}
+
+// ---- SHA3-256 parallel tree (RFC 6962 structure, NIST-aligned hash) ----
+
+export function hashLeafSha3(payload) {
+  return sha3_256(concat(LEAF_PREFIX, payload));
+}
+
+export function hashNodeSha3(left, right) {
+  return sha3_256(concat(NODE_PREFIX, left, right));
+}
+
+export function merkleRootSha3(leafHashes) {
+  if (leafHashes.length === 0) return sha3_256(new Uint8Array(0));
+  if (leafHashes.length === 1) return leafHashes[0];
+  let k = 1;
+  while (k * 2 < leafHashes.length) k *= 2;
+  const left = merkleRootSha3(leafHashes.slice(0, k));
+  const right = merkleRootSha3(leafHashes.slice(k));
+  return hashNodeSha3(left, right);
+}
+
+export function inclusionProofSha3(leafHashes, m) {
+  const n = leafHashes.length;
+  if (m < 0 || m >= n) throw new Error('index out of range');
+  const proof = [];
+  function recurse(lo, hi, idx) {
+    if (hi - lo === 1) return;
+    let k = 1;
+    while (k * 2 < hi - lo) k *= 2;
+    if (idx < lo + k) {
+      proof.push(merkleRootSha3(leafHashes.slice(lo + k, hi)));
+      recurse(lo, lo + k, idx);
+    } else {
+      proof.push(merkleRootSha3(leafHashes.slice(lo, lo + k)));
+      recurse(lo + k, hi, idx);
+    }
+  }
+  recurse(0, n, m);
+  return proof;
 }

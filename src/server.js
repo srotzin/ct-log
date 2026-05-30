@@ -23,8 +23,15 @@ import {
   consistencyProof,
   toHex,
   fromHex,
+  hashLeafSha3,
+  merkleRootSha3,
+  inclusionProofSha3,
 } from './merkle.js';
-import { operatorPublicKey, signSTH, operatorPqPublicKey, operatorPqScheme, signSTHPQ, signBytesPQ } from './keys.js';
+import {
+  operatorPublicKey, signSTH,
+  operatorPqPublicKey, operatorPqScheme, signSTHPQ, signBytesPQ,
+  signSTHDual, signSTHDualPQ,
+} from './keys.js';
 import { tryParseReceipt } from './receipt.js';
 import { fetchLatticeEntropy, LATTICE_NAMES, deriveLatticeKey, signWithLatticeKey } from './entropy.js';
 import * as ed from '@noble/ed25519';
@@ -39,11 +46,15 @@ const app = Fastify({ logger: { level: 'info' } });
 await app.register(cors, { origin: true });
 
 // --- Leaf cache: keep all leaf hashes in memory for proof generation. ---
-let leafCache = [];
+// Parallel BLAKE3 and SHA3-256 caches enable hash agility (Vector 1).
+let leafCache = [];        // BLAKE3 leaf hashes (legacy + primary)
+let leafCacheSha3 = [];    // SHA3-256 leaf hashes (NIST-only verification path)
 function rebuildLeafCache() {
-  const rows = stmts.getAllLeafHashes.all();
-  leafCache = rows.map(r => new Uint8Array(r.leaf_hash));
-  app.log.info({ size: leafCache.length }, 'leaf cache rebuilt');
+  const hashRows = stmts.getAllLeafHashes.all();
+  leafCache = hashRows.map(r => new Uint8Array(r.leaf_hash));
+  const payloadRows = stmts.getAllPayloads.all();
+  leafCacheSha3 = payloadRows.map(r => hashLeafSha3(new Uint8Array(r.payload)));
+  app.log.info({ size: leafCache.length, sha3_size: leafCacheSha3.length }, 'leaf cache rebuilt (BLAKE3 + SHA3-256)');
 }
 rebuildLeafCache();
 
@@ -52,13 +63,32 @@ async function publishSTH() {
   try {
     const size = leafCache.length;
     const root = merkleRoot(leafCache);
+    const rootSha3 = merkleRootSha3(leafCacheSha3);
     const ts = Date.now();
     const latest = stmts.latestTreeHead.get();
     const epoch = latest ? latest.epoch + 1 : 1;
+    // Legacy single-root STH (BLAKE3 only) -- preserved for backward compatibility.
     const sig = signSTH({ epoch, treeSize: size, root, ts });
     const pqSig = signSTHPQ({ epoch, treeSize: size, root, ts });
-    stmts.insertTreeHead.run(size, Buffer.from(root), ts, Buffer.from(sig), pqSig ? Buffer.from(pqSig) : null);
-    app.log.info({ epoch, tree_size: size, root_prefix: toHex(root).slice(0, 16) }, 'STH published');
+    // Hash-agile dual-root STH: classical + PQ signatures over
+    //   epoch(8) || tree_size(8) || root_blake3(32) || root_sha3(32) || ts(8)
+    const sigSha3 = signSTHDual({ epoch, treeSize: size, rootBlake3: root, rootSha3, ts });
+    const pqSigSha3 = signSTHDualPQ({ epoch, treeSize: size, rootBlake3: root, rootSha3, ts });
+    stmts.insertTreeHead.run(
+      size,
+      Buffer.from(root),
+      ts,
+      Buffer.from(sig),
+      pqSig ? Buffer.from(pqSig) : null,
+      Buffer.from(rootSha3),
+      Buffer.from(sigSha3),
+      pqSigSha3 ? Buffer.from(pqSigSha3) : null,
+    );
+    app.log.info({
+      epoch, tree_size: size,
+      root_blake3_prefix: toHex(root).slice(0, 16),
+      root_sha3_prefix: toHex(rootSha3).slice(0, 16),
+    }, 'STH published (dual-hash)');
   } catch (e) {
     app.log.error({ err: e.message }, 'STH publication failed');
   }
@@ -116,13 +146,21 @@ app.get('/v1/sth', async (req, reply) => {
   return {
     epoch: row.epoch,
     tree_size: row.tree_size,
-    root: toHex(row.root),
+    root: toHex(row.root),                       // BLAKE3 root (primary)
     ts: row.ts,
-    sig: toHex(row.sig),
+    sig: toHex(row.sig),                         // ed25519 over legacy canonical (BLAKE3 root only)
     operator_pubkey: operatorPublicKey ? toHex(operatorPublicKey) : null,
     pq_sig: row.pq_sig ? toHex(row.pq_sig) : null,
     pq_scheme: row.pq_sig ? operatorPqScheme : null,
     operator_pq_pubkey: operatorPqPublicKey ? toHex(operatorPqPublicKey) : null,
+    // Hash agility (Vector 1): parallel SHA3-256 root + dual-canonical signatures.
+    hash_agility: row.root_sha3 ? {
+      root_sha3_256: toHex(row.root_sha3),
+      sig_sha3: row.sig_sha3 ? toHex(row.sig_sha3) : null,
+      pq_sig_sha3: row.pq_sig_sha3 ? toHex(row.pq_sig_sha3) : null,
+      canonical_encoding: 'epoch(8) || tree_size(8) || root_blake3(32) || root_sha3_256(32) || ts(8), big-endian',
+      hashes: ['BLAKE3-256', 'SHA3-256'],
+    } : null,
   };
 });
 
@@ -166,6 +204,7 @@ app.post('/v1/submit', async (req, reply) => {
   const info = stmts.insertEntry.run(leafBuf, payload, agent_did, prev_receipt_hash, receipt_kind, ts);
   const seq = info.lastInsertRowid;
   leafCache.push(leaf);
+  leafCacheSha3.push(hashLeafSha3(payload));
 
   if (parsed.ok) {
     // depth = current vestigium depth for this DID + 1
@@ -219,8 +258,14 @@ app.get('/v1/proof-bundle/:leaf_hash', async (req, reply) => {
     return reply.code(409).send({ error: 'leaf not yet in published STH' });
   }
   const proof = inclusionProof(leafCache.slice(0, sth.tree_size), entry.seq - 1);
+  // Hash agility: also compute SHA3-256 leaf + inclusion proof against the SHA3 tree.
+  const sha3Available = sth.root_sha3 && leafCacheSha3.length >= sth.tree_size;
+  const sha3LeafHash = sha3Available ? hashLeafSha3(new Uint8Array(entry.payload)) : null;
+  const sha3Proof = sha3Available
+    ? inclusionProofSha3(leafCacheSha3.slice(0, sth.tree_size), entry.seq - 1)
+    : null;
   return {
-    bundle_version: 1,
+    bundle_version: 2,
     log_name: 'hive-ct-v1',
     leaf_hash,
     seq: entry.seq,
@@ -232,6 +277,13 @@ app.get('/v1/proof-bundle/:leaf_hash', async (req, reply) => {
       leaf_hash_scheme: 'BLAKE3(0x00 || payload_bytes)',
       node_hash_scheme: 'BLAKE3(0x01 || left || right)',
     },
+    merkle_sha3: sha3Available ? {
+      tree_size: sth.tree_size,
+      leaf_hash: toHex(sha3LeafHash),
+      proof: sha3Proof.map(p => toHex(p)),
+      leaf_hash_scheme: 'SHA3-256(0x00 || payload_bytes)',
+      node_hash_scheme: 'SHA3-256(0x01 || left || right)',
+    } : null,
     sth: {
       epoch: sth.epoch,
       tree_size: sth.tree_size,
@@ -242,6 +294,14 @@ app.get('/v1/proof-bundle/:leaf_hash', async (req, reply) => {
       pq_sig: sth.pq_sig ? toHex(sth.pq_sig) : null,
       pq_scheme: sth.pq_sig ? operatorPqScheme : null,
     },
+    sth_dual: sha3Available ? {
+      root_blake3: toHex(sth.root),
+      root_sha3_256: toHex(sth.root_sha3),
+      canonical_encoding: 'epoch(8) || tree_size(8) || root_blake3(32) || root_sha3_256(32) || ts(8), big-endian',
+      ed25519_sig: sth.sig_sha3 ? toHex(sth.sig_sha3) : null,
+      pq_sig: sth.pq_sig_sha3 ? toHex(sth.pq_sig_sha3) : null,
+      pq_scheme: sth.pq_sig_sha3 ? operatorPqScheme : null,
+    } : null,
     operator: {
       ed25519_pubkey: operatorPublicKey ? toHex(operatorPublicKey) : null,
       pq_pubkey: operatorPqPublicKey ? toHex(operatorPqPublicKey) : null,
@@ -250,6 +310,13 @@ app.get('/v1/proof-bundle/:leaf_hash', async (req, reply) => {
     verifier: {
       hint: 'node verify-bundle.mjs <path-to-bundle.json> -- offline, no network',
       source: 'https://github.com/srotzin/hive-protocol/blob/main/ct-log/scripts/verify-bundle.mjs',
+    },
+    ip: {
+      patent_status: 'Patent Pending',
+      patent_filed: '2026-05-08',
+      inventor: 'Steve Rotzin',
+      assignee: 'Hive Civilization, Inc.',
+      notice: 'The cryptographic transparency log architecture, the dual ed25519 + ML-DSA-65 STH co-signature, the dual-hash (BLAKE3 + SHA3-256) hash-agile Merkle commitment, the BLAKE3 leaf/internal domain-separated commitment scheme, the receipt-envelope canonical encoding, the multi-axis physical-entropy lattice handshake, and the self-verifying offline proof-bundle format are original work by Steve Rotzin. Patent Pending. Filed 2026-05-08.',
     },
   };
 });
@@ -522,6 +589,7 @@ app.post('/v1/attest/submit', async (req, reply) => {
   const info = stmts.insertEntry.run(leafBuf, payload, canonical_json.agent_did, prevHashBuf, canonical_json.action_type, ts);
   const seq = info.lastInsertRowid;
   leafCache.push(leaf);
+  leafCacheSha3.push(hashLeafSha3(payload));
 
   const current = stmts.vestigiumDepth.get(canonical_json.agent_did)?.depth || 0;
   const newDepth = current + 1;
@@ -695,6 +763,7 @@ app.post('/v1/lattice/:name/handshake', async (req, reply) => {
   const info = stmts.insertEntry.run(leafBuf, payload, lattice_did, prevHashBuf, 'lattice-entropy-handshake', ts);
   const seq = info.lastInsertRowid;
   leafCache.push(leaf);
+  leafCacheSha3.push(hashLeafSha3(payload));
   const newDepth = prev_depth + 1;
   stmts.insertVestigium.run(lattice_did, newDepth, seq, leafBuf, prevHashBuf, ts);
 

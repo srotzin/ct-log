@@ -55,6 +55,40 @@ export function signBytesPQ(canonicalBytes) {
   return ml_dsa65.sign(canonicalBytes, _pqKp.secretKey);
 }
 
+// ---- Hash-agility (Vector 1): dual-root STH ----
+// Extended canonical encoding includes BOTH Merkle roots:
+//   epoch(8) || tree_size(8) || root_blake3(32) || root_sha3(32) || ts(8)  big-endian
+// This is signed in parallel to the legacy single-root STH so any party
+// can verify either commitment independently.
+
+function encodeSTHDual({ epoch, treeSize, rootBlake3, rootSha3, ts }) {
+  const buf = Buffer.alloc(8 + 8 + 32 + 32 + 8);
+  buf.writeBigUInt64BE(BigInt(epoch), 0);
+  buf.writeBigUInt64BE(BigInt(treeSize), 8);
+  Buffer.from(rootBlake3).copy(buf, 16);
+  Buffer.from(rootSha3).copy(buf, 48);
+  buf.writeBigUInt64BE(BigInt(ts), 80);
+  return buf;
+}
+
+export function signSTHDual({ epoch, treeSize, rootBlake3, rootSha3, ts }) {
+  if (!operatorPrivateKey) throw new Error('operator ed25519 key not configured');
+  return ed.sign(encodeSTHDual({ epoch, treeSize, rootBlake3, rootSha3, ts }), operatorPrivateKey);
+}
+
+export function signSTHDualPQ({ epoch, treeSize, rootBlake3, rootSha3, ts }) {
+  if (!_pqKp) return null;
+  return ml_dsa65.sign(encodeSTHDual({ epoch, treeSize, rootBlake3, rootSha3, ts }), _pqKp.secretKey);
+}
+
+export function verifySTHDual({ epoch, treeSize, rootBlake3, rootSha3, ts, sig }, pubkey) {
+  return ed.verify(sig, encodeSTHDual({ epoch, treeSize, rootBlake3, rootSha3, ts }), pubkey);
+}
+
+export function verifySTHDualPQ({ epoch, treeSize, rootBlake3, rootSha3, ts, pqSig }, pqPubkey) {
+  return ml_dsa65.verify(pqSig, encodeSTHDual({ epoch, treeSize, rootBlake3, rootSha3, ts }), pqPubkey);
+}
+
 export function signSTH({ epoch, treeSize, root, ts }) {
   if (!operatorPrivateKey) throw new Error('operator ed25519 key not configured');
   // Canonical encoding: epoch(8) || treeSize(8) || root(32) || ts(8), big-endian.

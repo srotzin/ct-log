@@ -57,6 +57,16 @@ function columnExists(table, col) {
 if (!columnExists('tree_heads', 'pq_sig')) {
   db.exec(`ALTER TABLE tree_heads ADD COLUMN pq_sig BLOB`);
 }
+// Hash-agility (Vector 1): parallel SHA3-256 Merkle root + dual sigs over extended canonical encoding.
+if (!columnExists('tree_heads', 'root_sha3')) {
+  db.exec(`ALTER TABLE tree_heads ADD COLUMN root_sha3 BLOB`);
+}
+if (!columnExists('tree_heads', 'sig_sha3')) {
+  db.exec(`ALTER TABLE tree_heads ADD COLUMN sig_sha3 BLOB`);
+}
+if (!columnExists('tree_heads', 'pq_sig_sha3')) {
+  db.exec(`ALTER TABLE tree_heads ADD COLUMN pq_sig_sha3 BLOB`);
+}
 
 export const stmts = {
   insertEntry: db.prepare(`
@@ -66,11 +76,13 @@ export const stmts = {
   getEntryByHash: db.prepare(`SELECT * FROM entries WHERE leaf_hash = ?`),
   getEntryBySeq: db.prepare(`SELECT * FROM entries WHERE seq = ?`),
   getAllLeafHashes: db.prepare(`SELECT leaf_hash FROM entries ORDER BY seq ASC`),
+  getAllPayloads: db.prepare(`SELECT payload FROM entries ORDER BY seq ASC`),
   countEntries: db.prepare(`SELECT COUNT(*) AS n FROM entries`),
   getEntriesRange: db.prepare(`SELECT seq, leaf_hash, payload, agent_did, receipt_kind, ts FROM entries WHERE seq >= ? AND seq <= ? ORDER BY seq ASC`),
 
   insertTreeHead: db.prepare(`
-    INSERT INTO tree_heads (tree_size, root, ts, sig, pq_sig) VALUES (?, ?, ?, ?, ?)
+    INSERT INTO tree_heads (tree_size, root, ts, sig, pq_sig, root_sha3, sig_sha3, pq_sig_sha3)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `),
   latestTreeHead: db.prepare(`SELECT * FROM tree_heads ORDER BY epoch DESC LIMIT 1`),
   treeHeadBySize: db.prepare(`SELECT * FROM tree_heads WHERE tree_size = ? ORDER BY epoch DESC LIMIT 1`),
