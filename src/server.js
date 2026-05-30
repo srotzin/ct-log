@@ -33,6 +33,13 @@ import {
   signSTHDual, signSTHDualPQ,
 } from './keys.js';
 import { tryParseReceipt } from './receipt.js';
+import {
+  deriveHybridAgent,
+  hybridSign,
+  hybridVerify,
+  deriveDidFromPubkeys,
+  HYBRID_AGENT_SCHEME,
+} from './hybrid-agent.js';
 import { fetchLatticeEntropy, LATTICE_NAMES, deriveLatticeKey, signWithLatticeKey } from './entropy.js';
 import * as ed from '@noble/ed25519';
 import { sha512 } from '@noble/hashes/sha512';
@@ -317,6 +324,115 @@ app.get('/v1/proof-bundle/:leaf_hash', async (req, reply) => {
       inventor: 'Steve Rotzin',
       assignee: 'Hive Civilization, Inc.',
       notice: 'The cryptographic transparency log architecture, the dual ed25519 + ML-DSA-65 STH co-signature, the dual-hash (BLAKE3 + SHA3-256) hash-agile Merkle commitment, the BLAKE3 leaf/internal domain-separated commitment scheme, the receipt-envelope canonical encoding, the multi-axis physical-entropy lattice handshake, and the self-verifying offline proof-bundle format are original work by Steve Rotzin. Patent Pending. Filed 2026-05-08.',
+    },
+  };
+});
+
+// Vector 4 — Hybrid Ed25519 + ML-DSA-65 agent identity.
+// Demonstrates dual-key deterministic derivation, hybrid signing, and full
+// verification path. Every agent that wants post-quantum resistance can derive
+// a hybrid keypair from a single 32-byte seed and sign every receipt with BOTH
+// keys. A receipt is hybrid-valid only when BOTH signatures verify.
+//
+// Patent Pending. Filed 2026-05-08. Inventor: Steve Rotzin.
+app.post('/v1/agent/hybrid-attest', async (req, reply) => {
+  // Input: { seed_hex: 32-byte hex, message?: utf8 string }
+  // Output: agent_did, both pubkeys, both sigs over the message bytes.
+  // The seed is used IN-MEMORY ONLY and never logged or stored.
+  const { seed_hex, message } = req.body || {};
+  if (typeof seed_hex !== 'string' || !/^[0-9a-f]{64}$/i.test(seed_hex)) {
+    return reply.code(400).send({ error: 'seed_hex must be 32-byte hex (64 chars)' });
+  }
+  const seed = new Uint8Array(Buffer.from(seed_hex, 'hex'));
+  let kp;
+  try { kp = deriveHybridAgent(seed); }
+  catch (e) { return reply.code(400).send({ error: 'derive failed: ' + e.message }); }
+  const msg = typeof message === 'string' && message.length > 0
+    ? Buffer.from(message, 'utf8')
+    : Buffer.from(`hive-hybrid-attest-${kp.agent_did}-${Date.now()}`, 'utf8');
+  const sigs = hybridSign(kp, new Uint8Array(msg));
+  // Self-test: verify both sigs we just produced to prove the round-trip works.
+  const verify = hybridVerify(
+    new Uint8Array(msg),
+    sigs.ed25519_sig,
+    sigs.ml_dsa_65_sig,
+    toHex(kp.ed25519.public_key),
+    toHex(kp.ml_dsa_65.public_key)
+  );
+  return {
+    scheme: HYBRID_AGENT_SCHEME,
+    agent_did: kp.agent_did,
+    public_keys: {
+      ed25519: toHex(kp.ed25519.public_key),
+      ml_dsa_65: toHex(kp.ml_dsa_65.public_key),
+      ml_dsa_65_pubkey_bytes: kp.ml_dsa_65.public_key.length,
+    },
+    message_b64: Buffer.from(msg).toString('base64'),
+    message_utf8: msg.toString('utf8'),
+    signatures: {
+      ed25519: sigs.ed25519_sig,
+      ml_dsa_65: sigs.ml_dsa_65_sig,
+      ml_dsa_65_sig_bytes: sigs.ml_dsa_65_sig.length / 2,
+    },
+    self_test: {
+      ed25519_verify: verify.checks.ed25519,
+      ml_dsa_65_verify: verify.checks.ml_dsa_65,
+      hybrid_pass: verify.ok,
+    },
+    derivation: {
+      ed25519_seed_kdf: 'BLAKE3(seed || "ed25519-agent-v1", 32)',
+      ml_dsa_65_seed_kdf: 'BLAKE3(seed || "ml-dsa-65-agent-v1", 32)',
+      did_encoding: 'did:hive:hybrid:<BLAKE3(ed_pub || ml_dsa_pub, 32-byte hex)>',
+    },
+    ip: {
+      patent_status: 'Patent Pending',
+      patent_filed: '2026-05-08',
+      inventor: 'Steve Rotzin',
+      assignee: 'Hive Civilization, Inc.',
+      notice: 'The dual ed25519 + ML-DSA-65 agent identity, the deterministic hybrid-from-seed derivation, the dual-signature receipt canonical encoding, and the hybrid verification path that requires BOTH signatures to validate are original work by Steve Rotzin.',
+    },
+  };
+});
+
+// Vector 4 — verify endpoint. Stateless. Submit {message_b64, ed_pub, ml_pub,
+// ed_sig, ml_sig} and the server returns whether BOTH sigs pass. Useful for
+// third parties auditing hybrid-signed receipts offline.
+app.post('/v1/agent/hybrid-verify', async (req, reply) => {
+  const { message_b64, ed25519_pubkey, ml_dsa_65_pubkey, ed25519_sig, ml_dsa_65_sig } = req.body || {};
+  if (typeof message_b64 !== 'string') return reply.code(400).send({ error: 'message_b64 required' });
+  if (typeof ed25519_pubkey !== 'string' || !/^[0-9a-f]{64}$/i.test(ed25519_pubkey)) {
+    return reply.code(400).send({ error: 'ed25519_pubkey must be 32-byte hex' });
+  }
+  if (typeof ml_dsa_65_pubkey !== 'string' || !/^[0-9a-f]+$/i.test(ml_dsa_65_pubkey)) {
+    return reply.code(400).send({ error: 'ml_dsa_65_pubkey must be hex' });
+  }
+  if (typeof ed25519_sig !== 'string' || !/^[0-9a-f]{128}$/i.test(ed25519_sig)) {
+    return reply.code(400).send({ error: 'ed25519_sig must be 64-byte hex (128 chars)' });
+  }
+  if (typeof ml_dsa_65_sig !== 'string' || !/^[0-9a-f]+$/i.test(ml_dsa_65_sig)) {
+    return reply.code(400).send({ error: 'ml_dsa_65_sig must be hex' });
+  }
+  let msg;
+  try { msg = Buffer.from(message_b64, 'base64'); }
+  catch { return reply.code(400).send({ error: 'bad base64' }); }
+  const verify = hybridVerify(
+    new Uint8Array(msg),
+    ed25519_sig,
+    ml_dsa_65_sig,
+    ed25519_pubkey,
+    ml_dsa_65_pubkey
+  );
+  const recoveredDid = deriveDidFromPubkeys(ed25519_pubkey, ml_dsa_65_pubkey);
+  return {
+    scheme: HYBRID_AGENT_SCHEME,
+    hybrid_pass: verify.ok,
+    checks: verify.checks,
+    recovered_agent_did: recoveredDid,
+    ip: {
+      patent_status: 'Patent Pending',
+      patent_filed: '2026-05-08',
+      inventor: 'Steve Rotzin',
+      assignee: 'Hive Civilization, Inc.',
     },
   };
 });
